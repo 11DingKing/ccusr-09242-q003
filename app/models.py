@@ -7,6 +7,7 @@ from sqlalchemy import (
     ForeignKey,
     Text,
     Date,
+    UniqueConstraint,
     Enum as SAEnum,
 )
 from sqlalchemy.orm import relationship
@@ -23,6 +24,8 @@ from .enums import (
     MilestoneType,
     FollowUpStatus,
     FollowUpPriority,
+    FollowUpSource,
+    AccountingScope,
 )
 
 
@@ -337,10 +340,112 @@ class MonthlyCapacityReport(Base):
     local_material_procurement_10k = Column(Float, default=0.0)
     remarks = Column(Text)
     reported_by = Column(String(64))
+    # 当前生效版本号：1 为初次登记，受控修订成功后递增；统计与曲线均以生效版本为准
+    current_version_no = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     project = relationship("Project", back_populates="capacity_reports")
+    revisions = relationship(
+        "CapacityReportRevision",
+        back_populates="report",
+        cascade="all, delete-orphan",
+        order_by="CapacityReportRevision.revision_no",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "report_year",
+            "report_month",
+            name="uq_monthly_capacity_project_period",
+        ),
+    )
+
+
+class CapacityReportRevision(Base):
+    """月度产能的不可变版本记录。version_no=1 为初次登记，>=2 为受控修订。"""
+
+    __tablename__ = "capacity_report_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(
+        Integer,
+        ForeignKey("monthly_capacity_reports.id"),
+        nullable=False,
+        index=True,
+    )
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False, index=True)
+    revision_no = Column(Integer, nullable=False)
+    revised_by = Column(String(64), nullable=False)
+    reason = Column(Text, nullable=False)
+    idempotency_key = Column(String(128))
+    # 版本快照旧值（v1 时为 None）
+    from_actual_output_tonnes = Column(Float)
+    from_capacity_utilization_rate = Column(Float)
+    from_employee_count = Column(Integer)
+    from_local_material_procurement_10k = Column(Float)
+    from_remarks = Column(Text)
+    from_reported_by = Column(String(64))
+    # 版本快照新值
+    to_actual_output_tonnes = Column(Float, nullable=False)
+    to_capacity_utilization_rate = Column(Float)
+    to_employee_count = Column(Integer)
+    to_local_material_procurement_10k = Column(Float)
+    to_remarks = Column(Text)
+    to_reported_by = Column(String(64))
+    threshold_crossed = Column(String(32))
+    follow_up_action = Column(String(32))
+    supersedes_revision_id = Column(
+        Integer,
+        ForeignKey("capacity_report_revisions.id"),
+    )
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    report = relationship("MonthlyCapacityReport", back_populates="revisions", foreign_keys=[report_id])
+    supersedes = relationship(
+        "CapacityReportRevision",
+        remote_side="CapacityReportRevision.id",
+        foreign_keys=[supersedes_revision_id],
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "report_id",
+            "revision_no",
+            name="uq_capacity_revision_report_no",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_capacity_revision_idempotency_key",
+        ),
+    )
+
+
+class AccountingPeriod(Base):
+    """封账账期：scope=季度封账 绑定季度指标，scope=全局封账 作为封账边界。"""
+
+    __tablename__ = "accounting_periods"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scope = Column(SAEnum(AccountingScope), nullable=False)
+    year = Column(Integer, nullable=False, index=True)
+    quarter = Column(Integer)
+    # 账期覆盖的最后一个月份（year*12+month），小于等于该月份均视为已封账
+    closed_through_year = Column(Integer, nullable=False)
+    closed_through_month = Column(Integer, nullable=False)
+    closed_by = Column(String(64), nullable=False)
+    reason = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "scope",
+            "year",
+            "quarter",
+            name="uq_accounting_period_scope_quarter",
+        ),
+    )
 
 
 class CapacityFollowUp(Base):
@@ -353,10 +458,15 @@ class CapacityFollowUp(Base):
     description = Column(Text)
     status = Column(SAEnum(FollowUpStatus), nullable=False, default=FollowUpStatus.PENDING, index=True)
     priority = Column(SAEnum(FollowUpPriority), nullable=False, default=FollowUpPriority.MEDIUM)
+    source = Column(SAEnum(FollowUpSource), nullable=False, default=FollowUpSource.MANUAL)
     gap_percentage = Column(Float)
     responsible_person = Column(String(64))
     deadline = Column(Date)
     resolution = Column(Text)
+    revision_id = Column(Integer, ForeignKey("capacity_report_revisions.id"))
+    closed_by_revision_id = Column(
+        Integer, ForeignKey("capacity_report_revisions.id")
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

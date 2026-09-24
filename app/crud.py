@@ -10,6 +10,7 @@ from .enums import (
     MilestoneType,
     FollowUpStatus,
     FollowUpPriority,
+    FollowUpSource,
     ProcessingCategory,
 )
 from .services.status_flow import (
@@ -30,6 +31,12 @@ from .services.statistics import (
     get_overall_statistics as _svc_get_overall_statistics,
     get_capacity_overview_statistics as _svc_get_capacity_overview,
     get_project_capacity_curve_data as _svc_get_capacity_curve,
+)
+from .services import revisions as revision_service
+from .services.revisions import (
+    RevisionError,
+    PeriodSealedError,
+    RevisionConflictError,
 )
 
 
@@ -59,7 +66,11 @@ def list_entities(
 
 
 def create_entity(db: Session, obj_in: schemas.EntityCreate):
-    capabilities_data = obj_in.capabilities.model_dump() if hasattr(obj_in, 'capabilities') else []
+    capabilities_data = (
+        [c.model_dump() for c in obj_in.capabilities]
+        if getattr(obj_in, "capabilities", None)
+        else []
+    )
     entity_data = obj_in.model_dump(exclude={"capabilities"})
     db_entity = models.Entity(**entity_data)
     db.add(db_entity)
@@ -460,6 +471,9 @@ def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCre
     if project.status != ProjectStatus.COMMISSIONED:
         raise ValueError("仅已投产项目可登记月度产能")
 
+    # 封账月份拒绝登记
+    revision_service.ensure_period_open(db, obj_in.report_year, obj_in.report_month)
+
     existing = (
         db.query(models.MonthlyCapacityReport)
         .filter(
@@ -484,6 +498,7 @@ def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCre
     db.add(db_report)
     db.flush()
 
+    follow_up = None
     if promised > 0 and report_data["actual_output_tonnes"] < promised:
         gap_pct = round(
             ((promised - report_data["actual_output_tonnes"]) / promised) * 100, 2
@@ -501,8 +516,12 @@ def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCre
             priority=priority,
             gap_percentage=gap_pct,
             responsible_person=project.project_leader,
+            source=FollowUpSource.AUTO,
         )
         db.add(follow_up)
+
+    # v1 版本记录：初次登记本身也是版本链的起点
+    revision_service.record_initial_revision(db, db_report, follow_up)
 
     db.commit()
     db.refresh(db_report)
@@ -543,33 +562,81 @@ def list_capacity_reports(
 def update_capacity_report(
     db: Session, report_id: int, obj_in: schemas.MonthlyCapacityReportUpdate
 ):
-    db_report = get_capacity_report(db, report_id)
-    if not db_report:
-        return None
+    # 受控修订流程上线后，月度产能不允许直接覆盖；更正必须走修订接口留痕
+    raise RevisionError(
+        "月度产能不允许直接覆盖，请使用受控修订接口并填写修订原因"
+    )
 
-    update_data = obj_in.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(db_report, field, value)
 
-    project = get_project(db, project_id=db_report.project_id)
-    if project and "actual_output_tonnes" in update_data:
-        promised = _get_promised_monthly_capacity(project)
-        if promised > 0 and db_report.capacity_utilization_rate is None:
-            db_report.capacity_utilization_rate = round(
-                (update_data["actual_output_tonnes"] / promised) * 100, 2
-            )
+def revise_capacity_report(
+    db: Session, report_id: int, obj_in: schemas.CapacityReportRevisionCreate
+):
+    return revision_service.create_revision(db, report_id, obj_in)
 
-    db.commit()
-    db.refresh(db_report)
-    return db_report
+
+def list_capacity_revisions(db: Session, report_id: int):
+    return revision_service.list_revisions(db, report_id)
+
+
+def get_capacity_revision(db: Session, revision_id: int):
+    return revision_service.get_revision(db, revision_id)
 
 
 def delete_capacity_report(db: Session, report_id: int):
     db_report = get_capacity_report(db, report_id)
     if db_report:
+        # 封账月份拒绝删除
+        revision_service.ensure_period_open(
+            db, db_report.report_year, db_report.report_month
+        )
         db.delete(db_report)
         db.commit()
     return db_report
+
+
+def close_accounting_quarter(
+    db: Session,
+    year: int,
+    quarter: int,
+    closed_by: str,
+    reason: Optional[str] = None,
+    scope=revision_service.AccountingScope.QUARTER,
+):
+    return revision_service.close_quarter(
+        db, year, quarter, closed_by, reason, scope
+    )
+
+
+def reopen_accounting_quarter(
+    db: Session,
+    year: int,
+    quarter: int,
+    reopened_by: str,
+    reason: Optional[str] = None,
+    scope=revision_service.AccountingScope.QUARTER,
+):
+    return revision_service.reopen_quarter(
+        db, year, quarter, reopened_by, reason, scope
+    )
+
+
+def list_accounting_periods(db: Session):
+    return (
+        db.query(models.AccountingPeriod)
+        .order_by(
+            models.AccountingPeriod.closed_through_year.desc(),
+            models.AccountingPeriod.closed_through_month.desc(),
+        )
+        .all()
+    )
+
+
+def get_accounting_boundary(db: Session):
+    return revision_service.get_boundary(db)
+
+
+def get_quarterly_capacity_statistics(db: Session, year: int, quarter: int):
+    return revision_service.get_quarterly_statistics(db, year, quarter)
 
 
 def get_follow_up(db: Session, follow_up_id: int):

@@ -12,6 +12,8 @@ from .enums import (
     MilestoneType,
     FollowUpStatus,
     FollowUpPriority,
+    FollowUpSource,
+    AccountingScope,
 )
 
 
@@ -465,12 +467,12 @@ class OverallStatistics(BaseModel):
 
 
 class MonthlyCapacityReportBase(BaseModel):
-    report_year: int
-    report_month: int
-    actual_output_tonnes: float = 0.0
+    report_year: int = Field(..., ge=2000, le=2100)
+    report_month: int = Field(..., ge=1, le=12)
+    actual_output_tonnes: float = Field(0.0, ge=0)
     capacity_utilization_rate: Optional[float] = None
-    employee_count: Optional[int] = 0
-    local_material_procurement_10k: Optional[float] = 0.0
+    employee_count: Optional[int] = Field(0, ge=0)
+    local_material_procurement_10k: Optional[float] = Field(0.0, ge=0)
     remarks: Optional[str] = None
     reported_by: Optional[str] = None
 
@@ -488,11 +490,131 @@ class MonthlyCapacityReportUpdate(BaseModel):
     reported_by: Optional[str] = None
 
 
+class CapacityReportRevisionCreate(BaseModel):
+    """受控修订入参：必填修订原因与操作者，可选幂等键。"""
+
+    actual_output_tonnes: Optional[float] = Field(None, ge=0)
+    capacity_utilization_rate: Optional[float] = None
+    employee_count: Optional[int] = Field(None, ge=0)
+    local_material_procurement_10k: Optional[float] = Field(None, ge=0)
+    remarks: Optional[str] = None
+    reported_by: Optional[str] = None
+    reason: str = Field(..., min_length=1, description="修订原因，必填")
+    revised_by: str = Field(..., min_length=1, description="修订操作者，必填")
+    idempotency_key: Optional[str] = Field(
+        None,
+        max_length=128,
+        description="幂等键：相同键重复提交不会产生第二次影响",
+    )
+
+
+class CapacityReportRevision(BaseModel):
+    id: int
+    report_id: int
+    project_id: int
+    revision_no: int
+    revised_by: str
+    reason: str
+    idempotency_key: Optional[str] = None
+    from_actual_output_tonnes: Optional[float] = None
+    from_capacity_utilization_rate: Optional[float] = None
+    from_employee_count: Optional[int] = None
+    from_local_material_procurement_10k: Optional[float] = None
+    from_remarks: Optional[str] = None
+    from_reported_by: Optional[str] = None
+    to_actual_output_tonnes: float
+    to_capacity_utilization_rate: Optional[float] = None
+    to_employee_count: Optional[int] = None
+    to_local_material_procurement_10k: Optional[float] = None
+    to_remarks: Optional[str] = None
+    to_reported_by: Optional[str] = None
+    threshold_crossed: Optional[str] = None
+    follow_up_action: Optional[str] = None
+    supersedes_revision_id: Optional[int] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ClosedPeriod(BaseModel):
+    scope: AccountingScope
+    year: int
+    quarter: Optional[int] = None
+    closed_through_year: int
+    closed_through_month: int
+
+
+class AccountingBoundary(BaseModel):
+    """当前封账边界：closed_through 之前（含）的月份均拒绝更改。"""
+
+    closed_through_year: Optional[int] = None
+    closed_through_month: Optional[int] = None
+    closed_through_label: Optional[str] = None
+    periods: List[ClosedPeriod] = Field(default_factory=list)
+
+
+class RevisionFollowUpChange(BaseModel):
+    follow_up_id: int
+    action: str
+    title: str
+    status_before: FollowUpStatus
+    status_after: FollowUpStatus
+
+
+class CapacityReportRevisionResult(BaseModel):
+    """受控修订响应：封账边界 + 报告生效版本 + 新旧版本关系。"""
+
+    report: "MonthlyCapacityReport"
+    revision: CapacityReportRevision
+    idempotent_replay: bool = False
+    previous_version_no: int
+    threshold_crossed: Optional[str] = None
+    utilization_before: Optional[float] = None
+    utilization_after: Optional[float] = None
+    follow_up_action: Optional[str] = None
+    follow_up_changes: List[RevisionFollowUpChange] = Field(default_factory=list)
+    closed_follow_ups: List[int] = Field(default_factory=list)
+    created_follow_up_id: Optional[int] = None
+    accounting_boundary: AccountingBoundary
+
+
+class AccountingPeriodCloseRequest(BaseModel):
+    year: int = Field(..., ge=2000, le=2100)
+    quarter: int = Field(..., ge=1, le=4)
+    closed_by: str = Field(..., min_length=1)
+    reason: Optional[str] = None
+    scope: AccountingScope = AccountingScope.QUARTER
+
+
+class AccountingPeriodReopenRequest(BaseModel):
+    year: int = Field(..., ge=2000, le=2100)
+    quarter: int = Field(1, ge=1, le=4)
+    scope: AccountingScope = AccountingScope.QUARTER
+    reopened_by: str = Field(..., min_length=1)
+    reason: Optional[str] = None
+
+
+class AccountingPeriod(BaseModel):
+    id: int
+    scope: AccountingScope
+    year: int
+    quarter: Optional[int] = None
+    closed_through_year: int
+    closed_through_month: int
+    closed_by: str
+    reason: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class MonthlyCapacityReport(MonthlyCapacityReportBase):
     id: int
     project_id: int
+    current_version_no: int = 1
     created_at: datetime
     updated_at: datetime
+    revisions: List[CapacityReportRevision] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -528,6 +650,9 @@ class CapacityFollowUp(CapacityFollowUpBase):
     id: int
     project_id: int
     report_id: Optional[int] = None
+    source: FollowUpSource = FollowUpSource.MANUAL
+    revision_id: Optional[int] = None
+    closed_by_revision_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
@@ -582,4 +707,45 @@ class CapacityOverviewStatistics(BaseModel):
     categories: List[CategoryCapacityStatistics]
 
 
+class QuarterlyCapacityMonth(BaseModel):
+    period: str
+    year: int
+    month: int
+    actual_output_tonnes: float
+    utilization_rate: float
+    local_material_procurement_10k: float
+    version_no: int
+    revised_at: Optional[datetime] = None
+
+
+class QuarterlyCapacityItem(BaseModel):
+    project_id: int
+    project_name: str
+    promised_monthly_capacity_tonnes: float
+    months: List[QuarterlyCapacityMonth] = Field(default_factory=list)
+    total_actual_output_tonnes: float
+    total_local_procurement_10k: float
+    average_utilization_rate: float
+
+
+class QuarterlyCapacityStatistics(BaseModel):
+    """季度统计：全部取生效版本（current_version_no），可稳定重算。"""
+
+    year: int
+    quarter: int
+    start_year: int
+    start_month: int
+    end_year: int
+    end_month: int
+    accounting_boundary: "AccountingBoundary"
+    sealed: bool
+    items: List[QuarterlyCapacityItem] = Field(default_factory=list)
+    total_promised_capacity_tonnes: float
+    total_actual_output_tonnes: float
+    overall_utilization_rate: float
+    total_local_procurement_10k: float
+
+
 Project.model_rebuild()
+CapacityReportRevisionResult.model_rebuild()
+QuarterlyCapacityStatistics.model_rebuild()

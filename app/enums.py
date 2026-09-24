@@ -74,3 +74,14 @@ class FollowUpPriority(str, Enum):
     MEDIUM = "中"
     HIGH = "高"
     URGENT = "紧急"
+
+
+class FollowUpSource(str, Enum):
+    AUTO = "自动生成"
+    MANUAL = "手工创建"
+    REVISION = "修订联动"
+
+
+class AccountingScope(str, Enum):
+    GLOBAL = "全局封账"
+    QUARTER = "季度封账"
