@@ -4,8 +4,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .database import Base, engine
 from .routers import entities, parks, projects, workflow, statistics, capacity
+from .migrations import ensure_capacity_revision_schema
 
 Base.metadata.create_all(bind=engine)
+ensure_capacity_revision_schema()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

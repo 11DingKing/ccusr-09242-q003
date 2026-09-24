@@ -31,6 +31,13 @@ from .services.statistics import (
     get_capacity_overview_statistics as _svc_get_capacity_overview,
     get_project_capacity_curve_data as _svc_get_capacity_curve,
 )
+from .services import revisions as revision_service
+from .services.revisions import (
+    MonthClosedError,
+    RevisionNotFound,
+    VersionConflictError,
+    ConcurrentRevisionError,
+)
 
 
 def get_entity(db: Session, entity_id: int):
@@ -435,22 +442,16 @@ def get_overall_statistics(db: Session):
 
 
 def _get_promised_monthly_capacity(project: models.Project) -> float:
-    if project.promised_monthly_capacity_tonnes:
-        return project.promised_monthly_capacity_tonnes
-    if project.expected_annual_capacity_tonnes:
-        return project.expected_annual_capacity_tonnes / 12.0
-    return 0.0
+    return revision_service.get_promised_monthly_capacity(project)
+
+
+# 供修订服务等模块复用的对外别名
+get_promised_monthly_capacity = _get_promised_monthly_capacity
+determine_follow_up_priority = revision_service.determine_follow_up_priority
 
 
 def _determine_priority(gap_pct: float) -> FollowUpPriority:
-    if gap_pct >= 50:
-        return FollowUpPriority.URGENT
-    elif gap_pct >= 30:
-        return FollowUpPriority.HIGH
-    elif gap_pct >= 15:
-        return FollowUpPriority.MEDIUM
-    else:
-        return FollowUpPriority.LOW
+    return revision_service.determine_follow_up_priority(gap_pct)
 
 
 def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCreate):
@@ -459,6 +460,14 @@ def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCre
         return None
     if project.status != ProjectStatus.COMMISSIONED:
         raise ValueError("仅已投产项目可登记月度产能")
+
+    boundary = revision_service.get_closed_boundary(db)
+    if not revision_service.is_month_open(
+        obj_in.report_year, obj_in.report_month, boundary
+    ):
+        raise revision_service.MonthClosedError(
+            obj_in.report_year, obj_in.report_month, boundary
+        )
 
     existing = (
         db.query(models.MonthlyCapacityReport)
@@ -501,8 +510,15 @@ def create_capacity_report(db: Session, obj_in: schemas.MonthlyCapacityReportCre
             priority=priority,
             gap_percentage=gap_pct,
             responsible_person=project.project_leader,
+            source="AUTO",
+            auto_generated=1,
         )
         db.add(follow_up)
+
+    # 初始登记写入第 1 版快照，季度统计与后续修订都基于生效版本。
+    revision_service.create_initial_revision(
+        db, db_report, operator=db_report.reported_by
+    )
 
     db.commit()
     db.refresh(db_report)
@@ -543,32 +559,55 @@ def list_capacity_reports(
 def update_capacity_report(
     db: Session, report_id: int, obj_in: schemas.MonthlyCapacityReportUpdate
 ):
+    """旧版覆盖接口：封账月份拒绝更改；可修订月份同样落入版本记录。"""
     db_report = get_capacity_report(db, report_id)
     if not db_report:
         return None
 
+    boundary = revision_service.get_closed_boundary(db)
+    if not revision_service.is_month_open(
+        db_report.report_year, db_report.report_month, boundary
+    ):
+        raise revision_service.MonthClosedError(
+            db_report.report_year, db_report.report_month, boundary
+        )
+
     update_data = obj_in.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(db_report, field, value)
-
     project = get_project(db, project_id=db_report.project_id)
-    if project and "actual_output_tonnes" in update_data:
-        promised = _get_promised_monthly_capacity(project)
-        if promised > 0 and db_report.capacity_utilization_rate is None:
-            db_report.capacity_utilization_rate = round(
-                (update_data["actual_output_tonnes"] / promised) * 100, 2
-            )
+    promised = _get_promised_monthly_capacity(project) if project else 0.0
+    if (
+        promised > 0
+        and "actual_output_tonnes" in update_data
+        and update_data.get("capacity_utilization_rate") is None
+    ):
+        update_data["capacity_utilization_rate"] = round(
+            (update_data["actual_output_tonnes"] / promised) * 100, 2
+        )
 
-    db.commit()
-    db.refresh(db_report)
-    return db_report
+    revision_in = schemas.CapacityRevisionCreate(
+        reason="通过旧版更新接口修订（未填写修订原因）",
+        operator=update_data.get("reported_by") or db_report.reported_by or "旧版接口",
+        **update_data,
+    )
+    revision_service.apply_revision(
+        db, report_id, revision_in, change_type="LEGACY_UPDATE"
+    )
+    return get_capacity_report(db, report_id)
 
 
 def delete_capacity_report(db: Session, report_id: int):
     db_report = get_capacity_report(db, report_id)
-    if db_report:
-        db.delete(db_report)
-        db.commit()
+    if not db_report:
+        return None
+    boundary = revision_service.get_closed_boundary(db)
+    if not revision_service.is_month_open(
+        db_report.report_year, db_report.report_month, boundary
+    ):
+        raise revision_service.MonthClosedError(
+            db_report.report_year, db_report.report_month, boundary
+        )
+    db.delete(db_report)
+    db.commit()
     return db_report
 
 
@@ -607,7 +646,9 @@ def create_follow_up(db: Session, obj_in: schemas.CapacityFollowUpCreate):
     project = get_project(db, project_id=obj_in.project_id)
     if not project:
         return None
-    db_obj = models.CapacityFollowUp(**obj_in.model_dump())
+    db_obj = models.CapacityFollowUp(
+        **obj_in.model_dump(), source="MANUAL", auto_generated=0
+    )
     db.add(db_obj)
     db.commit()
     db.refresh(db_obj)
@@ -645,3 +686,29 @@ def get_project_capacity_curve(db: Session, project_id: int):
 
 def get_capacity_overview_statistics(db: Session):
     return _svc_get_capacity_overview(db)
+
+
+# ---------------------------------------------------------------------------
+# 受控修订：封账边界、版本记录
+# ---------------------------------------------------------------------------
+
+def get_capacity_closed_boundary(db: Session):
+    return revision_service.get_closed_boundary(db)
+
+
+def close_capacity_months(db: Session, obj_in: schemas.CapacityCloseMonthRequest):
+    return revision_service.close_months_through(
+        db,
+        close_year=obj_in.close_year,
+        close_month=obj_in.close_month,
+        reason=obj_in.reason,
+        operator=obj_in.operator,
+    )
+
+
+def revise_capacity_report(db: Session, report_id: int, obj_in):
+    return revision_service.apply_revision(db, report_id, obj_in)
+
+
+def list_capacity_revisions(db: Session, report_id: int):
+    return revision_service.list_revisions(db, report_id)

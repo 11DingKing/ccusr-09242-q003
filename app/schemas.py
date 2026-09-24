@@ -491,6 +491,7 @@ class MonthlyCapacityReportUpdate(BaseModel):
 class MonthlyCapacityReport(MonthlyCapacityReportBase):
     id: int
     project_id: int
+    current_version: int = 1
     created_at: datetime
     updated_at: datetime
 
@@ -528,10 +529,101 @@ class CapacityFollowUp(CapacityFollowUpBase):
     id: int
     project_id: int
     report_id: Optional[int] = None
+    source: str = "AUTO"
+    auto_generated: bool = True
+    last_revision_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class CapacityRevisionBase(BaseModel):
+    actual_output_tonnes: Optional[float] = None
+    capacity_utilization_rate: Optional[float] = None
+    employee_count: Optional[int] = None
+    local_material_procurement_10k: Optional[float] = None
+    remarks: Optional[str] = None
+    reported_by: Optional[str] = None
+
+
+class CapacityRevisionCreate(CapacityRevisionBase):
+    reason: str = Field(..., min_length=1, description="修订原因，必填以便追溯")
+    operator: Optional[str] = Field(None, description="操作者（修订发起人）")
+    expected_version: Optional[int] = Field(
+        None, description="乐观锁：提交时所基于的版本号，防止并发覆盖"
+    )
+    idempotency_key: Optional[str] = Field(
+        None, description="幂等键：相同键重复提交不产生第二次影响"
+    )
+
+
+class CapacityRevision(BaseModel):
+    id: int
+    report_id: int
+    project_id: int
+    version_no: int
+    actual_output_tonnes: float
+    capacity_utilization_rate: Optional[float] = None
+    employee_count: Optional[int] = None
+    local_material_procurement_10k: Optional[float] = None
+    remarks: Optional[str] = None
+    reported_by: Optional[str] = None
+    change_type: str
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ClosedBoundary(BaseModel):
+    year: int
+    month: int
+
+
+class CapacityFollowUpChange(BaseModel):
+    action: str
+    follow_up_id: int
+    title: str
+    status: str
+    priority: str
+    gap_percentage: Optional[float] = None
+
+
+class CapacityRevisionResponse(BaseModel):
+    message: str
+    idempotent: bool = False
+    effects_applied: bool = True
+    closed_boundary: Optional[ClosedBoundary] = None
+    report_id: int
+    project_id: int
+    report_year: int
+    report_month: int
+    current_version: int
+    previous_version_no: Optional[int] = None
+    new_version_no: int
+    relationship: str
+    threshold_crossed: bool = False
+    old_version: Optional[CapacityRevision] = None
+    new_version: CapacityRevision
+    follow_up_changes: List[CapacityFollowUpChange] = Field(default_factory=list)
+
+
+class CapacityCloseMonthRequest(BaseModel):
+    close_year: int = Field(..., ge=2000, le=2100)
+    close_month: int = Field(..., ge=1, le=12)
+    reason: Optional[str] = None
+    operator: Optional[str] = None
+
+
+class CapacityCloseMonthResponse(BaseModel):
+    message: str
+    closed_boundary: ClosedBoundary
+    closed_through: ClosedBoundary
+    reason: Optional[str] = None
+    operator: Optional[str] = None
 
 
 class CapacityCurvePoint(BaseModel):

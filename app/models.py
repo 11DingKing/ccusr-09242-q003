@@ -8,6 +8,7 @@ from sqlalchemy import (
     Text,
     Date,
     Enum as SAEnum,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -337,10 +338,72 @@ class MonthlyCapacityReport(Base):
     local_material_procurement_10k = Column(Float, default=0.0)
     remarks = Column(Text)
     reported_by = Column(String(64))
+    current_version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     project = relationship("Project", back_populates="capacity_reports")
+    revisions = relationship(
+        "CapacityReportRevision",
+        back_populates="report",
+        cascade="all, delete-orphan",
+        order_by="CapacityReportRevision.version_no",
+    )
+
+
+class CapacityReportRevision(Base):
+    """月度产能报告版本记录：初始登记为第 1 版，每次受控修订追加一版。"""
+
+    __tablename__ = "capacity_report_revisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    report_id = Column(
+        Integer,
+        ForeignKey("monthly_capacity_reports.id"),
+        nullable=False,
+        index=True,
+    )
+    project_id = Column(Integer, nullable=False, index=True)
+    version_no = Column(Integer, nullable=False)
+    actual_output_tonnes = Column(Float, nullable=False, default=0.0)
+    capacity_utilization_rate = Column(Float)
+    employee_count = Column(Integer, default=0)
+    local_material_procurement_10k = Column(Float, default=0.0)
+    remarks = Column(Text)
+    reported_by = Column(String(64))
+    change_type = Column(String(16), nullable=False, default="CREATE")
+    reason = Column(Text)
+    operator = Column(String(64))
+    idempotency_key = Column(String(128), index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    report = relationship("MonthlyCapacityReport", back_populates="revisions")
+
+    __table_args__ = (
+        UniqueConstraint("report_id", "version_no", name="uq_capacity_revision_version"),
+        UniqueConstraint(
+            "report_id",
+            "idempotency_key",
+            name="uq_capacity_revision_idempotency",
+        ),
+    )
+
+
+class CapacityClosedMonth(Base):
+    """已封账月份：封账边界之前（含）的年月一律拒绝修订，保护已结算季度指标。"""
+
+    __tablename__ = "capacity_closed_months"
+
+    id = Column(Integer, primary_key=True, index=True)
+    close_year = Column(Integer, nullable=False)
+    close_month = Column(Integer, nullable=False)
+    reason = Column(Text)
+    operator = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("close_year", "close_month", name="uq_capacity_closed_month"),
+    )
 
 
 class CapacityFollowUp(Base):
@@ -357,8 +420,16 @@ class CapacityFollowUp(Base):
     responsible_person = Column(String(64))
     deadline = Column(Date)
     resolution = Column(Text)
+    source = Column(String(16), nullable=False, default="AUTO")
+    auto_generated = Column(Integer, nullable=False, default=1)
+    last_revision_id = Column(
+        Integer,
+        ForeignKey("capacity_report_revisions.id"),
+        index=True,
+    )
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     project = relationship("Project", back_populates="capacity_follow_ups")
     report = relationship("MonthlyCapacityReport")
+    last_revision = relationship("CapacityReportRevision")

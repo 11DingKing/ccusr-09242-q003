@@ -10,14 +10,36 @@ from ..errors import (
     ERROR_NOT_FOUND,
     ERROR_OPERATION_FAILED,
 )
+from ..services.revisions import (
+    MonthClosedError,
+    VersionConflictError,
+    ConcurrentRevisionError,
+    RevisionNotFound,
+)
 
 router = APIRouter(prefix="/capacity", tags=["投产后产能兑现跟踪"])
+
+
+def _closed_month_response(exc: MonthClosedError):
+    return HTTPException(
+        status_code=HTTPStatus.CONFLICT,
+        detail={
+            "message": str(exc),
+            "code": "CAPACITY_MONTH_CLOSED",
+            "closed_boundary": {
+                "year": exc.boundary.close_year,
+                "month": exc.boundary.close_month,
+            },
+            "report_year": exc.year,
+            "report_month": exc.month,
+        },
+    )
 
 
 @router.post(
     "/reports",
     response_model=schemas.MonthlyCapacityReport,
-    summary="登记月度产能（自动计算达产率，低于承诺时自动生成跟进事项）",
+    summary="登记月度产能（自动计算达产率，低于承诺时自动生成跟进事项，写入第1版）",
 )
 def create_capacity_report(
     report_in: schemas.MonthlyCapacityReportCreate,
@@ -31,6 +53,8 @@ def create_capacity_report(
         )
     try:
         result = crud.create_capacity_report(db=db, obj_in=report_in)
+    except MonthClosedError as e:
+        raise _closed_month_response(e)
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.CONFLICT, detail=str(e))
     if not result:
@@ -76,14 +100,17 @@ def get_capacity_report(report_id: int, db: Session = Depends(get_db)):
 @router.put(
     "/reports/{report_id}",
     response_model=schemas.MonthlyCapacityReport,
-    summary="更新月度产能登记",
+    summary="更新月度产能登记（封账月份拒绝；可修订月份内部同样生成版本记录）",
 )
 def update_capacity_report(
     report_id: int,
     report_in: schemas.MonthlyCapacityReportUpdate,
     db: Session = Depends(get_db),
 ):
-    updated = crud.update_capacity_report(db, report_id=report_id, obj_in=report_in)
+    try:
+        updated = crud.update_capacity_report(db, report_id=report_id, obj_in=report_in)
+    except MonthClosedError as e:
+        raise _closed_month_response(e)
     if not updated:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
@@ -92,15 +119,108 @@ def update_capacity_report(
     return updated
 
 
-@router.delete("/reports/{report_id}", summary="删除月度产能登记")
+@router.delete("/reports/{report_id}", summary="删除月度产能登记（封账月份拒绝）")
 def delete_capacity_report(report_id: int, db: Session = Depends(get_db)):
-    deleted = crud.delete_capacity_report(db, report_id=report_id)
+    try:
+        deleted = crud.delete_capacity_report(db, report_id=report_id)
+    except MonthClosedError as e:
+        raise _closed_month_response(e)
     if not deleted:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail=ERROR_NOT_FOUND["capacity_report"],
         )
     return {"message": "删除成功", "report_id": report_id}
+
+
+@router.post(
+    "/reports/{report_id}/revisions",
+    response_model=schemas.CapacityRevisionResponse,
+    status_code=HTTPStatus.CREATED,
+    summary="受控修订：生成带原因/操作者的版本，跨阈值时联动未关闭跟进（支持幂等与乐观锁）",
+)
+def create_capacity_revision(
+    report_id: int,
+    revision_in: schemas.CapacityRevisionCreate,
+    db: Session = Depends(get_db),
+):
+    try:
+        return crud.revise_capacity_report(db, report_id=report_id, obj_in=revision_in)
+    except RevisionNotFound:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail=ERROR_NOT_FOUND["capacity_report"],
+        )
+    except MonthClosedError as e:
+        raise _closed_month_response(e)
+    except VersionConflictError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail={
+                "message": str(e),
+                "code": "CAPACITY_VERSION_CONFLICT",
+                "current_version": e.current,
+                "expected_version": e.expected,
+            },
+        )
+    except ConcurrentRevisionError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail={
+                "message": str(e),
+                "code": "CAPACITY_CONCURRENT_REVISION",
+            },
+        )
+
+
+@router.get(
+    "/reports/{report_id}/revisions",
+    response_model=List[schemas.CapacityRevision],
+    summary="查询月度产能报告的全部版本（含初始登记与历次修订）",
+)
+def list_capacity_revisions(report_id: int, db: Session = Depends(get_db)):
+    try:
+        return crud.list_capacity_revisions(db, report_id=report_id)
+    except RevisionNotFound:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_FOUND,
+            detail=ERROR_NOT_FOUND["capacity_report"],
+        )
+
+
+@router.get(
+    "/closed-boundary",
+    response_model=Optional[schemas.ClosedBoundary],
+    summary="查询当前封账边界（该年月及之前拒绝更改；未封账时返回 null）",
+)
+def get_closed_boundary(db: Session = Depends(get_db)):
+    boundary = crud.get_capacity_closed_boundary(db)
+    if not boundary:
+        return None
+    return {"year": boundary.close_year, "month": boundary.close_month}
+
+
+@router.post(
+    "/closed-boundary",
+    response_model=schemas.CapacityCloseMonthResponse,
+    summary="设置封账边界（截至指定年月含，保护已结算季度指标）",
+)
+def set_closed_boundary(
+    body: schemas.CapacityCloseMonthRequest,
+    db: Session = Depends(get_db),
+):
+    record = crud.close_capacity_months(db, body)
+    boundary = {"year": record.close_year, "month": record.close_month}
+    return {
+        "message": (
+            f"已封账至 {record.close_year}年{record.close_month}月，"
+            "该边界及之前月份的产能数据拒绝更改"
+        ),
+        "closed_boundary": boundary,
+        "closed_through": boundary,
+        "reason": record.reason,
+        "operator": record.operator,
+    }
 
 
 @router.post(
